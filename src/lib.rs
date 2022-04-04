@@ -29,7 +29,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         mpsc::Sender,
         Arc, Mutex,
-    },
+    }, fs::File,
 };
 
 use std::io::{BufWriter, Write};
@@ -207,6 +207,15 @@ impl FlushGuard {
             self.handle.set(Some(handle));
         }
     }
+
+    pub fn close(&self) {
+        if let Some(handle) = self.handle.take() {
+            let _ignored = self.sender.send(Message::Close);
+            if handle.join().is_err() {
+                eprintln!("tracing_chrome: Trace writing thread panicked.");
+            }
+        }
+    }
 }
 
 impl Drop for FlushGuard {
@@ -236,6 +245,7 @@ enum Message {
     NewThread(u64, String),
     Flush,
     Drop,
+    Close,
 }
 
 pub enum EventOrSpan<'a, 'b, S>
@@ -270,11 +280,28 @@ where
             write.write_all(b"[\n").unwrap();
 
             let mut has_started = false;
+            let mut has_completed = false;
+            let mut flush_trace = |writer: &mut BufWriter<File>| {
+                if !has_completed {
+                    println!("notcompleted");
+                    has_completed = true;
+                    writer.write_all(b"\n]").unwrap();
+                    println!("writeclosing");
+                    writer.flush().unwrap();
+                    println!("flushed");
+                }
+                println!("return from flush");
+            };
+
             for msg in rx {
                 if let Message::Flush = &msg {
                     write.flush().unwrap();
                     continue;
                 } else if let Message::Drop = &msg {
+                    flush_trace(&mut write);
+                    break;
+                } else if let Message::Close = &msg {
+                    flush_trace(&mut write);
                     break;
                 }
 
@@ -291,7 +318,7 @@ where
                         ("e", Some(ts), Some(callsite), Some(root_id))
                     }
                     Message::NewThread(_tid, _name) => ("M", None, None, None),
-                    Message::Flush | Message::Drop => panic!("Was supposed to break by now."),
+                    Message::Flush | Message::Drop | Message::Close => panic!("Was supposed to break by now."),
                 };
                 entry.insert("ph", ph.to_string().into());
                 entry.insert("pid", 1.into());
@@ -342,8 +369,7 @@ where
                 has_started = true;
             }
 
-            write.write_all(b"\n]").unwrap();
-            write.flush().unwrap();
+            flush_trace(&mut write);
         });
 
         let guard = FlushGuard {
